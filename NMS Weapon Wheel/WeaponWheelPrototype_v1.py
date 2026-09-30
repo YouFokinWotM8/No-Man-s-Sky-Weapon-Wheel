@@ -34,26 +34,93 @@ logger = logging.getLogger()
 
 
 # ===========================================================================
-# Confirmed NMS state / native functions
+# NMS signatures / dynamically resolved layout
 # ===========================================================================
 
-GLOBAL_STATE_PTR_RVA = 0x6E7AAE8
-WEAPON_OBJECT_OFFSET = 0x71CA70
+# No build-specific RVAs are used here.  These signatures are matched against
+# the loaded NMS.exe .text section.  Update-sensitive displacements/offsets are
+# wildcarded and then recovered from the matching instructions.
 
-CURRENT_MODE_OFFSET = 0xF74
-PENDING_MODE_OFFSET = 0xF6C
-SECONDARY_MODE_OFFSET = 0xF78
+GLOBAL_STATE_SIGNATURE = (
+    "48 89 5C 24 10 "
+    "48 89 6C 24 18 "
+    "56 "
+    "48 83 EC 20 "
+    "4C 8B 05 ?? ?? ?? ?? "
+    "48 8B E9 "
+    "33 F6 "
+    "48 89 7C 24 30 "
+    "8B 9D ?? ?? ?? ??"
+)
 
-PENDING_IDLE_SENTINEL = 21
+PRIMARY_SETTER_SIGNATURE = (
+    "48 89 5C 24 20 "
+    "57 "
+    "48 83 EC 60 "
+    "48 63 DA "
+    "48 8B F9 "
+    "8B D3 "
+    "E8 ?? ?? ?? ?? "
+    "84 C0 "
+    "0F 84 ?? ?? ?? ?? "
+    "48 63 87 ?? ?? ?? ??"
+)
 
-PRIMARY_SETTER_RVA = 0x13FFB80
-SECONDARY_SETTER_RVA = 0x1404CE0
+SECONDARY_SETTER_SIGNATURE = (
+    "48 89 5C 24 08 "
+    "48 89 6C 24 10 "
+    "48 89 74 24 18 "
+    "57 "
+    "48 83 EC 20 "
+    "48 8B 35 ?? ?? ?? ?? "
+    "48 8B D9 "
+    "8B A9 ?? ?? ?? ?? "
+    "48 63 FA "
+    "8B C7 "
+    "44 8B C7 "
+    "99 "
+    "41 83 E0 1F "
+    "83 E2 1F "
+    "03 C2 "
+    "C1 F8 05"
+)
 
-MODE_TABLE_OFFSET = 0x2352D
+PENDING_MODE_SIGNATURE = (
+    "C7 87 ?? ?? ?? ?? 15 00 00 00 "
+    "EB ?? "
+    "89 9F ?? ?? ?? ??"
+)
+
+MODE_TABLE_SIGNATURE = (
+    "48 8B C7 "
+    "48 03 C0 "
+    "80 BC C6 ?? ?? ?? ?? 00"
+)
+
+WEAPON_WRAPPER_SIGNATURE = (
+    "40 53 "
+    "48 83 EC 20 "
+    "48 8B D9 "
+    "48 8B 0D ?? ?? ?? ?? "
+    "83 B9 ?? ?? ?? ?? 02 "
+    "74 ?? "
+    "48 81 C1 ?? ?? ?? ?? "
+    "E8 ?? ?? ?? ?? "
+    "83 F8 01 "
+    "7E ?? "
+    "48 8B CB "
+    "48 83 C4 20 "
+    "5B "
+    "E9 ?? ?? ?? ??"
+)
+
 MODE_TABLE_STRIDE = 0x10
 
 MODE_SCAN_FIRST = 0
 MODE_SCAN_LAST = 20
+
+_NMS_LAYOUT = None
+_NMS_LAYOUT_LOCK = threading.Lock()
 
 
 # ===========================================================================
@@ -106,15 +173,6 @@ WHEEL_ORDER = [
 # Native setter declarations
 # ===========================================================================
 
-EXPECTED_PRIMARY_SETTER_PREFIX = bytes.fromhex(
-    "48 89 5C 24 20 "
-    "57 "
-    "48 83 EC 60 "
-    "48 63 DA "
-    "48 8B F9"
-)
-
-
 _SetWeaponModeProto = ctypes.WINFUNCTYPE(
     None,
     ctypes.c_void_p,
@@ -152,6 +210,22 @@ _kernel32.GetModuleHandleW.restype = ctypes.c_void_p
 _kernel32.GetCurrentProcessId.argtypes = []
 
 _kernel32.GetCurrentProcessId.restype = ctypes.c_uint32
+
+
+_kernel32.GetCurrentProcess.argtypes = []
+
+_kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+
+
+_kernel32.ReadProcessMemory.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+
+_kernel32.ReadProcessMemory.restype = ctypes.c_bool
 
 
 # ===========================================================================
@@ -231,6 +305,26 @@ _user32.GetForegroundWindow.argtypes = []
 _user32.GetForegroundWindow.restype = ctypes.c_void_p
 
 
+_user32.GetParent.argtypes = [
+    ctypes.c_void_p,
+]
+
+_user32.GetParent.restype = ctypes.c_void_p
+
+
+_user32.SetWindowPos.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_uint,
+]
+
+_user32.SetWindowPos.restype = ctypes.c_bool
+
+
 WNDENUMPROC = ctypes.WINFUNCTYPE(
     ctypes.c_bool,
     ctypes.c_void_p,
@@ -255,6 +349,12 @@ GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
+
+# Position the overlay with native Win32 coordinates instead of relying on
+# Tk's multi-monitor/DPI geometry translation.
+HWND_TOPMOST = ctypes.c_void_p(-1).value
+SWP_NOACTIVATE = 0x0010
+SWP_NOOWNERZORDER = 0x0200
 
 
 _user32.GetWindowLongW.argtypes = [
@@ -555,78 +655,986 @@ def _entry_name(
     )
 
 
+def _read_process_memory(
+    address,
+    size,
+):
+
+    address = int(address)
+    size = int(size)
+
+
+    if address <= 0:
+
+        raise RuntimeError(
+            f"Refusing to read invalid address 0x{address:X}."
+        )
+
+
+    if size <= 0 or size > 0x20000000:
+
+        raise RuntimeError(
+            f"Refusing unreasonable memory read size 0x{size:X}."
+        )
+
+
+    buffer = ctypes.create_string_buffer(
+        size
+    )
+
+    bytes_read = ctypes.c_size_t(
+        0
+    )
+
+    process = (
+        _kernel32.GetCurrentProcess()
+    )
+
+
+    ok = _kernel32.ReadProcessMemory(
+        process,
+        ctypes.c_void_p(address),
+        ctypes.cast(
+            buffer,
+            ctypes.c_void_p,
+        ),
+        size,
+        ctypes.byref(bytes_read),
+    )
+
+
+    if (
+        not ok
+        or bytes_read.value != size
+    ):
+
+        error = ctypes.get_last_error()
+
+        raise RuntimeError(
+            "Safe memory read failed at "
+            f"0x{address:X} for 0x{size:X} bytes "
+            f"(read=0x{bytes_read.value:X}, winerr={error})."
+        )
+
+
+    return buffer.raw
+
+
+def _read_u8(
+    address,
+):
+
+    return _read_process_memory(
+        address,
+        1,
+    )[0]
+
+
+def _read_i32(
+    address,
+):
+
+    return int.from_bytes(
+        _read_process_memory(
+            address,
+            4,
+        ),
+        "little",
+        signed=True,
+    )
+
+
+def _read_u32(
+    address,
+):
+
+    return int.from_bytes(
+        _read_process_memory(
+            address,
+            4,
+        ),
+        "little",
+        signed=False,
+    )
+
+
+def _read_i32_blob(
+    blob,
+    offset,
+):
+
+    return int.from_bytes(
+        blob[
+            offset:
+            offset + 4
+        ],
+        "little",
+        signed=True,
+    )
+
+
+def _read_u32_blob(
+    blob,
+    offset,
+):
+
+    return int.from_bytes(
+        blob[
+            offset:
+            offset + 4
+        ],
+        "little",
+        signed=False,
+    )
+
+
+def _read_pointer(
+    address,
+):
+
+    return int.from_bytes(
+        _read_process_memory(
+            address,
+            ctypes.sizeof(
+                ctypes.c_void_p
+            ),
+        ),
+        "little",
+        signed=False,
+    )
+
+
+def _compile_signature(
+    signature,
+):
+
+    values = bytearray()
+    mask = bytearray()
+
+
+    for token in signature.split():
+
+        if token in {
+            "?",
+            "??",
+        }:
+
+            values.append(
+                0
+            )
+
+            mask.append(
+                0
+            )
+
+        else:
+
+            values.append(
+                int(
+                    token,
+                    16,
+                )
+            )
+
+            mask.append(
+                1
+            )
+
+
+    return (
+        bytes(values),
+        bytes(mask),
+    )
+
+
+def _signature_matches(
+    data,
+    offset,
+    values,
+    mask,
+):
+
+    end = (
+        offset
+        + len(values)
+    )
+
+
+    if (
+        offset < 0
+        or end > len(data)
+    ):
+
+        return False
+
+
+    for index in range(
+        len(values)
+    ):
+
+        if (
+            mask[index]
+            and data[
+                offset + index
+            ] != values[index]
+        ):
+
+            return False
+
+
+    return True
+
+
+def _find_signature_offsets(
+    data,
+    signature,
+):
+
+    (
+        values,
+        mask,
+    ) = _compile_signature(
+        signature
+    )
+
+
+    best_start = -1
+    best_length = 0
+    run_start = 0
+    run_length = 0
+
+
+    for index in range(
+        len(mask) + 1
+    ):
+
+        literal = (
+            index < len(mask)
+            and mask[index]
+        )
+
+
+        if literal:
+
+            if run_length == 0:
+                run_start = index
+
+            run_length += 1
+
+        else:
+
+            if run_length > best_length:
+
+                best_start = run_start
+                best_length = run_length
+
+
+            run_length = 0
+
+
+    if best_length <= 0:
+
+        raise RuntimeError(
+            "Signature contains no literal bytes."
+        )
+
+
+    anchor = values[
+        best_start:
+        best_start + best_length
+    ]
+
+    matches = []
+    search_from = 0
+
+
+    while True:
+
+        found = data.find(
+            anchor,
+            search_from,
+        )
+
+
+        if found < 0:
+            break
+
+
+        candidate = (
+            found
+            - best_start
+        )
+
+
+        if _signature_matches(
+            data,
+            candidate,
+            values,
+            mask,
+        ):
+
+            matches.append(
+                candidate
+            )
+
+
+        search_from = (
+            found + 1
+        )
+
+
+    return matches
+
+
+def _find_unique_signature(
+    text_bytes,
+    text_base,
+    name,
+    signature,
+):
+
+    matches = _find_signature_offsets(
+        text_bytes,
+        signature,
+    )
+
+
+    if len(matches) != 1:
+
+        raise RuntimeError(
+            f"Unsupported NMS build: {name} signature "
+            f"matched {len(matches)} locations; expected exactly 1."
+        )
+
+
+    offset = matches[0]
+
+
+    return (
+        text_base + offset,
+        offset,
+    )
+
+
+def _get_text_section(
+    module_base,
+):
+
+    header = _read_process_memory(
+        module_base,
+        0x1000,
+    )
+
+
+    if header[0:2] != b"MZ":
+
+        raise RuntimeError(
+            "Unsupported NMS build: NMS.exe has no valid MZ header."
+        )
+
+
+    pe_offset = _read_u32_blob(
+        header,
+        0x3C,
+    )
+
+
+    if (
+        pe_offset < 0x40
+        or pe_offset > 0x100000
+    ):
+
+        raise RuntimeError(
+            f"Unsupported NMS build: invalid PE offset 0x{pe_offset:X}."
+        )
+
+
+    minimum_header_size = (
+        pe_offset
+        + 24
+    )
+
+
+    if minimum_header_size > len(header):
+
+        header = _read_process_memory(
+            module_base,
+            minimum_header_size,
+        )
+
+
+    if header[
+        pe_offset:
+        pe_offset + 4
+    ] != b"PE\x00\x00":
+
+        raise RuntimeError(
+            "Unsupported NMS build: NMS.exe has no valid PE signature."
+        )
+
+
+    number_of_sections = int.from_bytes(
+        header[
+            pe_offset + 6:
+            pe_offset + 8
+        ],
+        "little",
+    )
+
+    size_of_optional_header = int.from_bytes(
+        header[
+            pe_offset + 20:
+            pe_offset + 22
+        ],
+        "little",
+    )
+
+    section_table = (
+        pe_offset
+        + 24
+        + size_of_optional_header
+    )
+
+    full_header_size = (
+        section_table
+        + number_of_sections * 40
+    )
+
+
+    if full_header_size > len(header):
+
+        header = _read_process_memory(
+            module_base,
+            full_header_size,
+        )
+
+
+    for index in range(
+        number_of_sections
+    ):
+
+        section = (
+            section_table
+            + index * 40
+        )
+
+        name = header[
+            section:
+            section + 8
+        ].split(
+            b"\x00",
+            1,
+        )[0]
+
+
+        if name != b".text":
+            continue
+
+
+        virtual_size = _read_u32_blob(
+            header,
+            section + 8,
+        )
+
+        virtual_address = _read_u32_blob(
+            header,
+            section + 12,
+        )
+
+        raw_size = _read_u32_blob(
+            header,
+            section + 16,
+        )
+
+        text_size = (
+            virtual_size
+            or raw_size
+        )
+
+
+        if (
+            virtual_address <= 0
+            or text_size <= 0
+            or text_size > 0x20000000
+        ):
+
+            raise RuntimeError(
+                "Unsupported NMS build: invalid .text section bounds."
+            )
+
+
+        text_base = (
+            module_base
+            + virtual_address
+        )
+
+        text_bytes = _read_process_memory(
+            text_base,
+            text_size,
+        )
+
+
+        return (
+            text_base,
+            text_bytes,
+        )
+
+
+    raise RuntimeError(
+        "Unsupported NMS build: could not locate NMS.exe .text section."
+    )
+
+
+def _verify_signature_at(
+    address,
+    name,
+    signature,
+):
+
+    (
+        values,
+        mask,
+    ) = _compile_signature(
+        signature
+    )
+
+    actual = _read_process_memory(
+        address,
+        len(values),
+    )
+
+
+    if not _signature_matches(
+        actual,
+        0,
+        values,
+        mask,
+    ):
+
+        raise RuntimeError(
+            f"{name} signature changed after resolution; native call refused."
+        )
+
+
+def _resolve_nms_layout():
+
+    global _NMS_LAYOUT
+
+
+    with _NMS_LAYOUT_LOCK:
+
+        if _NMS_LAYOUT is not None:
+
+            return _NMS_LAYOUT
+
+
+        module_base = int(
+            _kernel32.GetModuleHandleW(
+                "NMS.exe"
+            )
+            or 0
+        )
+
+
+        if not module_base:
+
+            raise RuntimeError(
+                "Could not resolve loaded NMS.exe module base."
+            )
+
+
+        (
+            text_base,
+            text_bytes,
+        ) = _get_text_section(
+            module_base
+        )
+
+
+        (
+            global_match,
+            global_offset,
+        ) = _find_unique_signature(
+            text_bytes,
+            text_base,
+            "global-state",
+            GLOBAL_STATE_SIGNATURE,
+        )
+
+        (
+            primary_setter_address,
+            primary_offset,
+        ) = _find_unique_signature(
+            text_bytes,
+            text_base,
+            "primary setter",
+            PRIMARY_SETTER_SIGNATURE,
+        )
+
+        (
+            secondary_setter_address,
+            secondary_offset,
+        ) = _find_unique_signature(
+            text_bytes,
+            text_base,
+            "secondary setter",
+            SECONDARY_SETTER_SIGNATURE,
+        )
+
+        (
+            pending_match,
+            pending_offset_in_text,
+        ) = _find_unique_signature(
+            text_bytes,
+            text_base,
+            "pending-primary field",
+            PENDING_MODE_SIGNATURE,
+        )
+
+        (
+            mode_table_match,
+            mode_table_offset_in_text,
+        ) = _find_unique_signature(
+            text_bytes,
+            text_base,
+            "installed-mode table",
+            MODE_TABLE_SIGNATURE,
+        )
+
+        (
+            weapon_wrapper_match,
+            weapon_wrapper_offset,
+        ) = _find_unique_signature(
+            text_bytes,
+            text_base,
+            "weapon-object wrapper",
+            WEAPON_WRAPPER_SIGNATURE,
+        )
+
+
+        global_disp = _read_i32_blob(
+            text_bytes,
+            global_offset + 18,
+        )
+
+        global_ptr_address = (
+            global_match
+            + 22
+            + global_disp
+        )
+
+        global_ptr_rva = (
+            global_ptr_address
+            - module_base
+        )
+
+
+        # Cross-check the secondary setter's RIP-relative global reference.
+        secondary_global_disp = _read_i32_blob(
+            text_bytes,
+            secondary_offset + 23,
+        )
+
+        secondary_global_address = (
+            secondary_setter_address
+            + 27
+            + secondary_global_disp
+        )
+
+
+        if secondary_global_address != global_ptr_address:
+
+            raise RuntimeError(
+                "Unsupported NMS build: global-state signatures disagree."
+            )
+
+
+        current_mode_offset_a = _read_u32_blob(
+            text_bytes,
+            global_offset + 34,
+        )
+
+        current_mode_offset_b = _read_u32_blob(
+            text_bytes,
+            primary_offset + 34,
+        )
+
+
+        if current_mode_offset_a != current_mode_offset_b:
+
+            raise RuntimeError(
+                "Unsupported NMS build: current-primary field offsets disagree."
+            )
+
+
+        secondary_mode_offset = _read_u32_blob(
+            text_bytes,
+            secondary_offset + 32,
+        )
+
+        pending_mode_offset_a = _read_u32_blob(
+            text_bytes,
+            pending_offset_in_text + 2,
+        )
+
+        pending_idle_sentinel = _read_u32_blob(
+            text_bytes,
+            pending_offset_in_text + 6,
+        )
+
+        pending_mode_offset_b = _read_u32_blob(
+            text_bytes,
+            pending_offset_in_text + 14,
+        )
+
+
+        if pending_mode_offset_a != pending_mode_offset_b:
+
+            raise RuntimeError(
+                "Unsupported NMS build: pending-primary field offsets disagree."
+            )
+
+
+        mode_table_offset = _read_u32_blob(
+            text_bytes,
+            mode_table_offset_in_text + 9,
+        )
+
+        weapon_object_offset = _read_u32_blob(
+            text_bytes,
+            weapon_wrapper_offset + 28,
+        )
+
+
+        # Structural checks.  These are deliberately broad: they reject obviously
+        # wrong matches without tying the mod to one exact NMS build.
+        object_fields = {
+            current_mode_offset_a,
+            pending_mode_offset_a,
+            secondary_mode_offset,
+        }
+
+
+        if (
+            len(object_fields) != 3
+            or any(
+                value <= 0
+                or value > 0x10000
+                for value in object_fields
+            )
+        ):
+
+            raise RuntimeError(
+                "Unsupported NMS build: resolved weapon field offsets are implausible."
+            )
+
+
+        if (
+            pending_idle_sentinel > 0x10000
+            or mode_table_offset <= 0
+            or mode_table_offset > 0x1000000
+            or weapon_object_offset <= 0
+            or weapon_object_offset > 0x10000000
+        ):
+
+            raise RuntimeError(
+                "Unsupported NMS build: resolved layout values are implausible."
+            )
+
+
+        if not (
+            0
+            < pending_match - primary_setter_address
+            < 0x2000
+        ):
+
+            raise RuntimeError(
+                "Unsupported NMS build: pending-primary pattern is not inside "
+                "the expected primary-setter neighborhood."
+            )
+
+
+        if not (
+            0
+            < mode_table_match - secondary_setter_address
+            < 0x1000
+        ):
+
+            raise RuntimeError(
+                "Unsupported NMS build: mode-table pattern is not inside "
+                "the expected secondary-setter neighborhood."
+            )
+
+
+        layout = {
+            "module_base":
+                module_base,
+
+            "global_state_ptr_address":
+                global_ptr_address,
+
+            "global_state_ptr_rva":
+                global_ptr_rva,
+
+            "weapon_object_offset":
+                weapon_object_offset,
+
+            "current_mode_offset":
+                current_mode_offset_a,
+
+            "pending_mode_offset":
+                pending_mode_offset_a,
+
+            "secondary_mode_offset":
+                secondary_mode_offset,
+
+            "pending_idle_sentinel":
+                pending_idle_sentinel,
+
+            "primary_setter_address":
+                primary_setter_address,
+
+            "primary_setter_rva":
+                primary_setter_address
+                - module_base,
+
+            "secondary_setter_address":
+                secondary_setter_address,
+
+            "secondary_setter_rva":
+                secondary_setter_address
+                - module_base,
+
+            "mode_table_offset":
+                mode_table_offset,
+        }
+
+
+        _NMS_LAYOUT = layout
+
+
+        logger.warning(
+            "[WeaponWheel] RESOLVED | "
+            "global_rva=0x%X | "
+            "weapon_off=0x%X | "
+            "current=0x%X | "
+            "pending=0x%X | "
+            "secondary=0x%X | "
+            "idle=%d | "
+            "primary_rva=0x%X | "
+            "secondary_rva=0x%X | "
+            "mode_table=0x%X",
+            layout["global_state_ptr_rva"],
+            layout["weapon_object_offset"],
+            layout["current_mode_offset"],
+            layout["pending_mode_offset"],
+            layout["secondary_mode_offset"],
+            layout["pending_idle_sentinel"],
+            layout["primary_setter_rva"],
+            layout["secondary_setter_rva"],
+            layout["mode_table_offset"],
+        )
+
+
+        return layout
+
+
 def _read_weapon_state():
 
-    module_base = int(
-        _kernel32.GetModuleHandleW(
-            "NMS.exe"
+    layout = (
+        _resolve_nms_layout()
+    )
+
+    global_state = (
+        _read_pointer(
+            layout[
+                "global_state_ptr_address"
+            ]
         )
-        or 0
     )
 
 
-    if not module_base:
+    if (
+        global_state < 0x10000
+        or global_state >= 0x0000800000000000
+    ):
 
         raise RuntimeError(
-            "Could not resolve loaded NMS.exe module base."
-        )
-
-
-    global_ptr_address = (
-        module_base
-        + GLOBAL_STATE_PTR_RVA
-    )
-
-
-    global_state = int(
-        ctypes.c_void_p.from_address(
-            global_ptr_address
-        ).value
-        or 0
-    )
-
-
-    if not global_state:
-
-        raise RuntimeError(
-            "NMS global-state pointer is null at "
-            f"0x{global_ptr_address:X}."
+            "NMS global-state pointer is null or implausible at "
+            f"0x{layout['global_state_ptr_address']:X}: "
+            f"0x{global_state:X}."
         )
 
 
     weapon_object = (
         global_state
-        + WEAPON_OBJECT_OFFSET
+        + layout[
+            "weapon_object_offset"
+        ]
     )
-
 
     current_mode = (
-        ctypes.c_int32.from_address(
+        _read_i32(
             weapon_object
-            + CURRENT_MODE_OFFSET
-        ).value
+            + layout[
+                "current_mode_offset"
+            ]
+        )
     )
-
 
     pending_mode = (
-        ctypes.c_int32.from_address(
+        _read_i32(
             weapon_object
-            + PENDING_MODE_OFFSET
-        ).value
+            + layout[
+                "pending_mode_offset"
+            ]
+        )
     )
-
 
     secondary_mode = (
-        ctypes.c_int32.from_address(
+        _read_i32(
             weapon_object
-            + SECONDARY_MODE_OFFSET
-        ).value
+            + layout[
+                "secondary_mode_offset"
+            ]
+        )
     )
+
+
+    for (
+        label,
+        value,
+    ) in (
+        (
+            "current primary",
+            current_mode,
+        ),
+        (
+            "pending primary",
+            pending_mode,
+        ),
+        (
+            "secondary",
+            secondary_mode,
+        ),
+    ):
+
+        if not (
+            -1
+            <= value
+            <= 0x10000
+        ):
+
+            raise RuntimeError(
+                f"Resolved {label} value is implausible: {value}."
+            )
 
 
     return {
         "module_base":
-            module_base,
+            layout[
+                "module_base"
+            ],
 
         "global_state":
             global_state,
@@ -635,12 +1643,14 @@ def _read_weapon_state():
             weapon_object,
 
         "primary_setter_address":
-            module_base
-            + PRIMARY_SETTER_RVA,
+            layout[
+                "primary_setter_address"
+            ],
 
         "secondary_setter_address":
-            module_base
-            + SECONDARY_SETTER_RVA,
+            layout[
+                "secondary_setter_address"
+            ],
 
         "current_mode":
             current_mode,
@@ -650,6 +1660,16 @@ def _read_weapon_state():
 
         "secondary_mode":
             secondary_mode,
+
+        "pending_idle_sentinel":
+            layout[
+                "pending_idle_sentinel"
+            ],
+
+        "mode_table_offset":
+            layout[
+                "mode_table_offset"
+            ],
     }
 
 
@@ -658,7 +1678,6 @@ def _read_mode_table():
     state = (
         _read_weapon_state()
     )
-
 
     values = {}
 
@@ -670,18 +1689,19 @@ def _read_mode_table():
 
         address = (
             state["global_state"]
-            + MODE_TABLE_OFFSET
+            + state[
+                "mode_table_offset"
+            ]
             + (
                 mode
                 * MODE_TABLE_STRIDE
             )
         )
 
-
         values[mode] = (
-            ctypes.c_uint8.from_address(
+            _read_u8(
                 address
-            ).value
+            )
         )
 
 
@@ -788,48 +1808,22 @@ def _verify_primary_setter(
     address,
 ):
 
-    actual = ctypes.string_at(
+    _verify_signature_at(
         address,
-        len(
-            EXPECTED_PRIMARY_SETTER_PREFIX
-        ),
+        "Primary setter",
+        PRIMARY_SETTER_SIGNATURE,
     )
-
-
-    if (
-        actual
-        != EXPECTED_PRIMARY_SETTER_PREFIX
-    ):
-
-        raise RuntimeError(
-            "Primary setter byte check FAILED; "
-            "native call refused. "
-            f"Expected "
-            f"{EXPECTED_PRIMARY_SETTER_PREFIX.hex(' ')}, "
-            f"got "
-            f"{actual.hex(' ')}."
-        )
 
 
 def _verify_secondary_setter(
     address,
 ):
 
-    prefix = ctypes.string_at(
+    _verify_signature_at(
         address,
-        8,
+        "Secondary setter",
+        SECONDARY_SETTER_SIGNATURE,
     )
-
-
-    if (
-        len(prefix) != 8
-        or prefix == b"\x00" * 8
-    ):
-
-        raise RuntimeError(
-            "Secondary setter address "
-            "did not look readable."
-        )
 
 
 # ===========================================================================
@@ -1820,10 +2814,11 @@ class _WheelOverlay:
                 )
 
 
+                # Only let Tk size the window. Native SetWindowPos below
+                # handles the actual desktop coordinates so mixed-DPI and
+                # multi-monitor layouts cannot reinterpret the target position.
                 root.geometry(
                     f"{size}x{size}"
-                    f"+{state['left']}"
-                    f"+{state['top']}"
                 )
 
 
@@ -1869,9 +2864,33 @@ class _WheelOverlay:
 
                 root.deiconify()
 
-                root.lift()
-
                 root.update_idletasks()
+
+                # Tk exposes a child/client HWND through winfo_id() on
+                # Windows. Moving that child leaves the actual top-level
+                # wrapper at its old desktop position (commonly 0,0), which
+                # is why v3 appeared in the monitor's top-left corner.
+                client_hwnd = root.winfo_id()
+                wrapper_hwnd = (
+                    _user32.GetParent(client_hwnd)
+                    or client_hwnd
+                )
+
+                if not _user32.SetWindowPos(
+                    wrapper_hwnd,
+                    HWND_TOPMOST,
+                    int(state["left"]),
+                    int(state["top"]),
+                    int(size),
+                    int(size),
+                    SWP_NOACTIVATE
+                    | SWP_NOOWNERZORDER,
+                ):
+                    raise RuntimeError(
+                        "SetWindowPos failed while positioning wheel."
+                    )
+
+                root.lift()
 
 
                 apply_clickthrough()
@@ -2061,15 +3080,41 @@ class WeaponWheelPrototype(Mod):
         )
 
 
-        self._install_g_takeover()
+        try:
+
+            layout = (
+                _resolve_nms_layout()
+            )
 
 
-        self._set_status(
-            "READY | "
-            "hold G for radial wheel | "
-            "vanilla G suppression enabled | "
-            "F8 fallback enabled"
-        )
+            self._install_g_takeover()
+
+
+            self._set_status(
+                "READY | signatures resolved | "
+                f"global_rva=0x{layout['global_state_ptr_rva']:X} | "
+                f"weapon_off=0x{layout['weapon_object_offset']:X} | "
+                f"primary_rva=0x{layout['primary_setter_rva']:X} | "
+                f"secondary_rva=0x{layout['secondary_setter_rva']:X} | "
+                "hold G for radial wheel | "
+                "F8 fallback enabled"
+            )
+
+
+        except Exception as exc:
+
+            self._set_status(
+                "UNSUPPORTED NMS BUILD | "
+                "wheel disabled | "
+                f"{exc!r}"
+            )
+
+
+            logger.exception(
+                "[WeaponWheel] "
+                "NMS layout resolution failed; "
+                "G takeover was NOT installed."
+            )
 
 
     # =======================================================================
@@ -2428,7 +3473,7 @@ class WeaponWheelPrototype(Mod):
 
                     if (
                         state["pending_mode"]
-                        != PENDING_IDLE_SENTINEL
+                        != state["pending_idle_sentinel"]
                     ):
 
                         self._set_status(
@@ -2735,7 +3780,7 @@ class WeaponWheelPrototype(Mod):
 
                 if (
                     state["pending_mode"]
-                    != PENDING_IDLE_SENTINEL
+                    != state["pending_idle_sentinel"]
                 ):
 
                     self._set_status(
@@ -2823,7 +3868,7 @@ class WeaponWheelPrototype(Mod):
                     == native_id
                     and
                     pending
-                    == PENDING_IDLE_SENTINEL
+                    == after_state["pending_idle_sentinel"]
                 ):
 
                     result = (
