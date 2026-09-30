@@ -1832,7 +1832,12 @@ def _verify_secondary_setter(
 
 class _WheelOverlay:
 
-    OVERLAY_SIZE = 620
+    # UI tuning: smaller, less intrusive, and positioned in front of the
+    # held multitool area instead of dead-center on the screen.
+    OVERLAY_SIZE = 450
+    OVERLAY_ALPHA = 0.78
+    ANCHOR_X_FRACTION = 0.56
+    ANCHOR_Y_FRACTION = 0.60
 
 
     def __init__(
@@ -1938,6 +1943,14 @@ class _WheelOverlay:
                 True,
             )
 
+            # Global alpha is applied to the shaped top-level window.
+            # The region is also applied to that same top-level HWND below,
+            # which prevents a translucent rectangular box around the wheel.
+            root.attributes(
+                "-alpha",
+                self.OVERLAY_ALPHA,
+            )
+
 
             canvas = tk.Canvas(
                 root,
@@ -1987,6 +2000,15 @@ class _WheelOverlay:
 
             def apply_clickthrough():
 
+                # Keep these extended styles on Tk's client/child HWND,
+                # exactly as in the last build where mouse selection worked.
+                #
+                # Do NOT put WS_EX_NOACTIVATE on the top-level wrapper.
+                # NMS captures the mouse while it remains the foreground
+                # window.  If the wrapper is marked NOACTIVATE, opening the
+                # wheel cannot temporarily take focus, so NMS keeps consuming
+                # mouse movement as camera input.  That is what caused the
+                # player to look down/right while the cursor appeared stuck.
                 hwnd = (
                     root.winfo_id()
                 )
@@ -2138,8 +2160,21 @@ class _WheelOverlay:
                 This removes the old 620x620 rectangular background.
                 """
 
-                hwnd = (
+                client_hwnd = (
                     root.winfo_id()
+                )
+
+                # Alpha is a top-level/window-manager effect on Windows.
+                # If the region is applied only to Tk's child/client HWND,
+                # the wrapper remains a translucent rectangle.  Therefore
+                # ONLY the region is applied to the wrapper.  The click-through
+                # / NOACTIVATE styles intentionally stay on the child HWND so
+                # opening the wheel still releases NMS mouse capture.
+                hwnd = (
+                    _user32.GetParent(
+                        client_hwnd
+                    )
+                    or client_hwnd
                 )
 
 
@@ -2673,10 +2708,10 @@ class _WheelOverlay:
                         fill="white",
                         font=(
                             "Segoe UI",
-                            10,
+                            9,
                             "bold",
                         ),
-                        width=105,
+                        width=90,
                         justify="center",
                     )
 
@@ -2719,10 +2754,10 @@ class _WheelOverlay:
                     fill="white",
                     font=(
                         "Segoe UI",
-                        12,
+                        10,
                         "bold",
                     ),
-                    width=135,
+                    width=110,
                     justify="center",
                 )
 
@@ -2767,15 +2802,24 @@ class _WheelOverlay:
                 )
 
 
+                # Anchor the wheel slightly right and below screen center.
+                # Across the supplied 120-degree-FOV screenshots this lands
+                # in the open space in front of the held multitool.
                 game_cx = (
                     game_left
-                    + game_width // 2
+                    + int(
+                        game_width
+                        * self.ANCHOR_X_FRACTION
+                    )
                 )
 
 
                 game_cy = (
                     game_top
-                    + game_height // 2
+                    + int(
+                        game_height
+                        * self.ANCHOR_Y_FRACTION
+                    )
                 )
 
 
@@ -2802,13 +2846,13 @@ class _WheelOverlay:
 
 
                 state["outer"] = min(
-                    270.0,
+                    195.0,
                     size * 0.43,
                 )
 
 
                 state["inner"] = max(
-                    70.0,
+                    56.0,
                     state["outer"]
                     * 0.29,
                 )
