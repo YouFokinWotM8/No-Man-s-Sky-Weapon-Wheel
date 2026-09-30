@@ -1,5 +1,7 @@
 # No Man's Sky Radial Multitool Weapon Wheel
 
+THE RECENT 1.8GB UPDATE ON SEPT 30 HAS BROKEN THE MOD. I WILL BE WORKING ON FIXING IT, AS WELL AS MAKING IT A BIT MORE FUTURE PROOF.
+
 > Reverse-engineering notes and development history for a pyMHF / NMS.py mod that replaces tedious multitool weapon cycling with direct radial selection.
 
 ## Project status
