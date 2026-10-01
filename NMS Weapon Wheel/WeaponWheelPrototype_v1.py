@@ -9,11 +9,14 @@ Controls:
 F8 remains as an unsuppressed fallback while G takeover is being tested.
 
 This build:
-- primary + secondary native setters
-- dynamic mode-table filtering
+- primary + secondary native multitool setters
+- dynamic multitool mode-table filtering
 - modes 9 and 10 filtered
-- shaped Win32 wheel window: no rectangular background
-- G is intercepted only while NMS is the foreground application
+- continuous circular Win32 wheel window: no rectangular background or wedge holes
+- ship wheel filtered through the native weapon availability predicate
+- G opens the multitool wheel on foot / while standing inside a ship
+- G opens a starship weapon wheel while actively piloting
+- starship selection uses NMS's native weapon-cycle routine; no direct mode writes
 """
 
 import ctypes
@@ -114,7 +117,35 @@ WEAPON_WRAPPER_SIGNATURE = (
     "E9 ?? ?? ?? ??"
 )
 
+# Native cGcSpaceshipWeapons cycle-next routine discovered from the live
+# write to meWeaponMode.  The two field displacements are wildcarded and
+# recovered below, so the +0xA4 mode field is not trusted blindly.
+SHIP_CYCLE_SIGNATURE = (
+    "48 89 5C 24 08 "
+    "48 89 6C 24 10 "
+    "48 89 74 24 18 "
+    "57 "
+    "48 83 EC 30 "
+    "8B A9 ?? ?? ?? ?? "
+    "48 8B F9 "
+    "33 DB "
+    "90 "
+    "8B B7 ?? ?? ?? ?? "
+    "B8 93 24 49 92 "
+    "FF C6 "
+    "03 F3 "
+    "F7 EE "
+    "03 D6 "
+    "C1 FA 02"
+)
+
 MODE_TABLE_STRIDE = 0x10
+
+# cGcSpaceshipWeapons is embedded at +0x60 in the controlled
+# cGcSpaceshipComponent on the build we traced.  We validate the resulting
+# object and dynamically recover meWeaponMode from the native cycle function.
+SHIP_WEAPONS_OBJECT_OFFSET = 0x60
+SHIP_MODE_COUNT = 7
 
 MODE_SCAN_FIRST = 0
 MODE_SCAN_LAST = 20
@@ -152,6 +183,28 @@ SECONDARY_MODE_NAMES = {
 }
 
 
+# User-confirmed mappings; uninstalled slots retain internal enum labels.
+SHIP_MODE_NAMES = {
+    0: "Phase Beam",
+    1: "Photon Cannon",
+    2: "Positron Ejector",
+    3: "Minigun",
+    4: "Plasma",
+    5: "Missile",
+    6: "Rocket Launcher",
+}
+
+# Native availability predicate called by the ship cycle routine.
+SHIP_AVAILABLE_SIGNATURE = (
+    "4C 8B DC 49 89 4B 08 55 48 83 EC 60 48 63 CA "
+    "48 8B 15 ?? ?? ?? ?? 48 C1 E1 06 48 8B 42 60 "
+    "48 63 AC 01 ?? ?? ?? ?? 81 FD D1 00 00 00"
+)
+_ShipAvailableProto = ctypes.WINFUNCTYPE(
+    ctypes.c_bool, ctypes.c_void_p, ctypes.c_int32
+)
+
+
 WHEEL_ORDER = [
     ("primary", 5),
     ("primary", 0),
@@ -177,6 +230,12 @@ _SetWeaponModeProto = ctypes.WINFUNCTYPE(
     None,
     ctypes.c_void_p,
     ctypes.c_int32,
+)
+
+
+_CycleShipWeaponProto = ctypes.WINFUNCTYPE(
+    None,
+    ctypes.c_void_p,
 )
 
 
@@ -649,10 +708,23 @@ def _entry_name(
         )
 
 
-    return SECONDARY_MODE_NAMES.get(
-        native_id,
-        f"Unknown secondary {native_id}",
-    )
+    if kind == "secondary":
+
+        return SECONDARY_MODE_NAMES.get(
+            native_id,
+            f"Unknown secondary {native_id}",
+        )
+
+
+    if kind == "ship":
+
+        return SHIP_MODE_NAMES.get(
+            native_id,
+            f"Unknown ship mode {native_id}",
+        )
+
+
+    return f"Unknown {kind} {native_id}"
 
 
 def _read_process_memory(
@@ -1311,6 +1383,16 @@ def _resolve_nms_layout():
             WEAPON_WRAPPER_SIGNATURE,
         )
 
+        (
+            ship_cycle_address,
+            ship_cycle_offset,
+        ) = _find_unique_signature(
+            text_bytes,
+            text_base,
+            "ship weapon cycle",
+            SHIP_CYCLE_SIGNATURE,
+        )
+
 
         global_disp = _read_i32_blob(
             text_bytes,
@@ -1405,6 +1487,61 @@ def _resolve_nms_layout():
             weapon_wrapper_offset + 28,
         )
 
+        ship_mode_offset_a = _read_u32_blob(
+            text_bytes,
+            ship_cycle_offset + 22,
+        )
+
+        ship_mode_offset_b = _read_u32_blob(
+            text_bytes,
+            ship_cycle_offset + 34,
+        )
+
+
+        if ship_mode_offset_a != ship_mode_offset_b:
+
+            raise RuntimeError(
+                "Unsupported NMS build: ship mode field offsets disagree."
+            )
+
+
+        # Resolve the availability predicate from the cycle routine's CALL.
+        if text_bytes[ship_cycle_offset + 0x44] != 0xE8:
+            raise RuntimeError("Ship availability call instruction changed.")
+        ship_available_address = (
+            ship_cycle_address + 0x49
+            + _read_i32_blob(text_bytes, ship_cycle_offset + 0x45)
+        )
+        if not text_base <= ship_available_address < text_base + len(text_bytes):
+            raise RuntimeError("Ship availability target is outside .text.")
+        _verify_signature_at(
+            ship_available_address, "Ship availability", SHIP_AVAILABLE_SIGNATURE
+        )
+
+        # Cross-check against the NMS.py structure definition when available.
+        typed_ship_mode_offset = int(
+            getattr(
+                getattr(
+                    nms.cGcSpaceshipWeapons,
+                    "meWeaponMode",
+                    None,
+                ),
+                "offset",
+                -1,
+            )
+        )
+
+
+        if (
+            typed_ship_mode_offset >= 0
+            and typed_ship_mode_offset != ship_mode_offset_a
+        ):
+
+            raise RuntimeError(
+                "Unsupported NMS build: native ship mode offset disagrees "
+                "with NMS.py."
+            )
+
 
         # Structural checks.  These are deliberately broad: they reject obviously
         # wrong matches without tying the mod to one exact NMS build.
@@ -1435,6 +1572,8 @@ def _resolve_nms_layout():
             or mode_table_offset > 0x1000000
             or weapon_object_offset <= 0
             or weapon_object_offset > 0x10000000
+            or ship_mode_offset_a <= 0
+            or ship_mode_offset_a > 0x10000
         ):
 
             raise RuntimeError(
@@ -1507,6 +1646,21 @@ def _resolve_nms_layout():
 
             "mode_table_offset":
                 mode_table_offset,
+
+            "ship_available_address": ship_available_address,
+
+            "ship_cycle_address":
+                ship_cycle_address,
+
+            "ship_cycle_rva":
+                ship_cycle_address
+                - module_base,
+
+            "ship_mode_offset":
+                ship_mode_offset_a,
+
+            "ship_weapons_object_offset":
+                SHIP_WEAPONS_OBJECT_OFFSET,
         }
 
 
@@ -1523,7 +1677,9 @@ def _resolve_nms_layout():
             "idle=%d | "
             "primary_rva=0x%X | "
             "secondary_rva=0x%X | "
-            "mode_table=0x%X",
+            "mode_table=0x%X | "
+            "ship_cycle_rva=0x%X | "
+            "ship_mode=0x%X",
             layout["global_state_ptr_rva"],
             layout["weapon_object_offset"],
             layout["current_mode_offset"],
@@ -1533,6 +1689,8 @@ def _resolve_nms_layout():
             layout["primary_setter_rva"],
             layout["secondary_setter_rva"],
             layout["mode_table_offset"],
+            layout["ship_cycle_rva"],
+            layout["ship_mode_offset"],
         )
 
 
@@ -1826,6 +1984,79 @@ def _verify_secondary_setter(
     )
 
 
+def _verify_ship_cycle(
+    address,
+):
+
+    _verify_signature_at(
+        address,
+        "Ship weapon cycle",
+        SHIP_CYCLE_SIGNATURE,
+    )
+
+
+def _read_ship_weapon_state(
+    ship_ptr,
+):
+
+    layout = _resolve_nms_layout()
+
+    ship_ptr = int(
+        ship_ptr
+        or 0
+    )
+
+
+    if (
+        ship_ptr < 0x10000
+        or ship_ptr >= 0x0000800000000000
+    ):
+
+        raise RuntimeError(
+            f"Invalid active ship pointer 0x{ship_ptr:X}."
+        )
+
+
+    weapons_ptr = (
+        ship_ptr
+        + layout[
+            "ship_weapons_object_offset"
+        ]
+    )
+
+    mode = _read_i32(
+        weapons_ptr
+        + layout[
+            "ship_mode_offset"
+        ]
+    )
+
+
+    if not (
+        0
+        <= mode
+        < SHIP_MODE_COUNT
+    ):
+
+        raise RuntimeError(
+            "Resolved ship weapon mode is implausible: "
+            f"{mode}."
+        )
+
+
+    return {
+        "ship_ptr": ship_ptr,
+        "weapons_ptr": weapons_ptr,
+        "mode": mode,
+        "cycle_address": layout[
+            "ship_cycle_address"
+        ],
+        "mode_offset": layout[
+            "ship_mode_offset"
+        ],
+    }
+
+
 # ===========================================================================
 # Shaped radial overlay
 # ===========================================================================
@@ -1860,6 +2091,8 @@ class _WheelOverlay:
 
         self._current_secondary = None
 
+        self._current_ship = None
+
         self._saved_cursor = None
 
 
@@ -1875,6 +2108,7 @@ class _WheelOverlay:
         entries,
         current_primary,
         current_secondary,
+        current_ship=None,
     ):
 
         self._commands.put(
@@ -1883,6 +2117,7 @@ class _WheelOverlay:
                 list(entries),
                 current_primary,
                 current_secondary,
+                current_ship,
             )
         )
 
@@ -2152,240 +2387,24 @@ class _WheelOverlay:
             # ===============================================================
 
             def apply_window_shape():
-
-                """
-                Clip the HWND to the union of the wedges and center circle.
-
-                There is literally no native window outside this region.
-                This removes the old 620x620 rectangular background.
-                """
-
-                client_hwnd = (
-                    root.winfo_id()
+                """Use a solid circular native region with no radial holes."""
+                client_hwnd = root.winfo_id()
+                hwnd = _user32.GetParent(client_hwnd) or client_hwnd
+                cx = state["cx"]
+                cy = state["cy"]
+                radius = state["outer"] + 3.0
+                region = _gdi32.CreateEllipticRgn(
+                    math.floor(cx - radius),
+                    math.floor(cy - radius),
+                    math.ceil(cx + radius) + 1,
+                    math.ceil(cy + radius) + 1,
                 )
-
-                # Alpha is a top-level/window-manager effect on Windows.
-                # If the region is applied only to Tk's child/client HWND,
-                # the wrapper remains a translucent rectangle.  Therefore
-                # ONLY the region is applied to the wrapper.  The click-through
-                # / NOACTIVATE styles intentionally stay on the child HWND so
-                # opening the wheel still releases NMS mouse capture.
-                hwnd = (
-                    _user32.GetParent(
-                        client_hwnd
-                    )
-                    or client_hwnd
-                )
-
-
-                combined = (
-                    _gdi32.CreateRectRgn(
-                        0,
-                        0,
-                        0,
-                        0,
-                    )
-                )
-
-
-                if not combined:
-
-                    raise RuntimeError(
-                        "CreateRectRgn failed."
-                    )
-
-
-                success = False
-
-
-                try:
-
-                    count = len(
-                        self._entries
-                    )
-
-
-                    if count:
-
-                        step = (
-                            math.tau
-                            / count
-                        )
-
-
-                        for index in range(
-                            count
-                        ):
-
-                            center = (
-                                -math.pi / 2.0
-                                + (
-                                    index
-                                    * step
-                                )
-                            )
-
-
-                            # Slightly wider than the drawn polygon
-                            # so outlines never get clipped.
-
-                            a0 = (
-                                center
-                                - step / 2.0
-                                + 0.008
-                            )
-
-                            a1 = (
-                                center
-                                + step / 2.0
-                                - 0.008
-                            )
-
-
-                            points = wedge_points(
-                                state["cx"],
-                                state["cy"],
-                                max(
-                                    0.0,
-                                    state["inner"]
-                                    - 3.0,
-                                ),
-                                state["outer"]
-                                + 3.0,
-                                a0,
-                                a1,
-                            )
-
-
-                            point_array_type = (
-                                POINT
-                                * len(points)
-                            )
-
-
-                            point_array = (
-                                point_array_type(
-                                    *[
-                                        POINT(
-                                            int(
-                                                round(x)
-                                            ),
-                                            int(
-                                                round(y)
-                                            ),
-                                        )
-                                        for (
-                                            x,
-                                            y,
-                                        )
-                                        in points
-                                    ]
-                                )
-                            )
-
-
-                            region = (
-                                _gdi32.CreatePolygonRgn(
-                                    point_array,
-                                    len(points),
-                                    WINDING,
-                                )
-                            )
-
-
-                            if region:
-
-                                _gdi32.CombineRgn(
-                                    combined,
-                                    combined,
-                                    region,
-                                    RGN_OR,
-                                )
-
-
-                                _gdi32.DeleteObject(
-                                    region
-                                )
-
-
-                    inner = int(
-                        round(
-                            state["inner"]
-                            + 2
-                        )
-                    )
-
-
-                    cx = int(
-                        round(
-                            state["cx"]
-                        )
-                    )
-
-                    cy = int(
-                        round(
-                            state["cy"]
-                        )
-                    )
-
-
-                    center_region = (
-                        _gdi32.CreateEllipticRgn(
-                            cx - inner,
-                            cy - inner,
-                            cx + inner + 1,
-                            cy + inner + 1,
-                        )
-                    )
-
-
-                    if center_region:
-
-                        _gdi32.CombineRgn(
-                            combined,
-                            combined,
-                            center_region,
-                            RGN_OR,
-                        )
-
-
-                        _gdi32.DeleteObject(
-                            center_region
-                        )
-
-
-                    result = (
-                        _user32.SetWindowRgn(
-                            hwnd,
-                            combined,
-                            True,
-                        )
-                    )
-
-
-                    if result == 0:
-
-                        raise RuntimeError(
-                            "SetWindowRgn failed."
-                        )
-
-
-                    # Windows owns the region
-                    # after SetWindowRgn succeeds.
-                    success = True
-
-
-                finally:
-
-                    if (
-                        not success
-                        and combined
-                    ):
-
-                        _gdi32.DeleteObject(
-                            combined
-                        )
-
+                if not region:
+                    raise RuntimeError("CreateEllipticRgn failed.")
+                if not _user32.SetWindowRgn(hwnd, region, True):
+                    _gdi32.DeleteObject(region)
+                    raise RuntimeError("SetWindowRgn failed.")
+                # Windows owns the region after a successful SetWindowRgn.
 
             # ===============================================================
             # Mouse selection
@@ -2564,14 +2583,14 @@ class _WheelOverlay:
                     a0 = (
                         center
                         - step / 2.0
-                        + 0.015
+                        + 0.0
                     )
 
 
                     a1 = (
                         center
                         + step / 2.0
-                        - 0.015
+                        - 0.0
                     )
 
 
@@ -2596,6 +2615,17 @@ class _WheelOverlay:
                             native_id
                             ==
                             self._current_secondary
+                        )
+                    ) or (
+                        (
+                            kind
+                            == "ship"
+                        )
+                        and
+                        (
+                            native_id
+                            ==
+                            self._current_ship
                         )
                     )
 
@@ -2770,6 +2800,7 @@ class _WheelOverlay:
                 entries,
                 current_primary,
                 current_secondary,
+                current_ship=None,
             ):
 
                 (
@@ -2794,6 +2825,11 @@ class _WheelOverlay:
 
                 self._current_secondary = (
                     current_secondary
+                )
+
+
+                self._current_ship = (
+                    current_ship
                 )
 
 
@@ -3013,6 +3049,7 @@ class _WheelOverlay:
                                 command[1],
                                 command[2],
                                 command[3],
+                                command[4],
                             )
 
 
@@ -3113,6 +3150,24 @@ class WeaponWheelPrototype(Mod):
 
         self._g_down = False
 
+        # Live pointer to the spaceship component currently controlled
+        # by the player.  The hook below captures it when NMS reports
+        # mbControllerActive=True and mpController is non-null.
+        self._active_ship_ptr = 0
+        self._ship_open_pending = False
+        self._ship_available_modes = ()
+
+        # The wheel context is frozen from key-down until key-up so a context
+        # transition cannot make the release execute the wrong backend.
+        self._wheel_context = None
+
+        # Starship requests are advanced by exactly one native cycle call per
+        # controlled-ship update.  This keeps execution on the game's ship thread
+        # and avoids burst-calling the native routine from the keyboard callback.
+        self._ship_target_mode = None
+        self._ship_cycle_start_mode = None
+        self._ship_cycle_steps = 0
+
 
         self._status = (
             "Loading..."
@@ -3140,7 +3195,8 @@ class WeaponWheelPrototype(Mod):
                 f"weapon_off=0x{layout['weapon_object_offset']:X} | "
                 f"primary_rva=0x{layout['primary_setter_rva']:X} | "
                 f"secondary_rva=0x{layout['secondary_setter_rva']:X} | "
-                "hold G for radial wheel | "
+                f"ship_cycle_rva=0x{layout['ship_cycle_rva']:X} | "
+                "hold G for context radial wheel | "
                 "F8 fallback enabled"
             )
 
@@ -3197,6 +3253,400 @@ class WeaponWheelPrototype(Mod):
 
 
     # =======================================================================
+    # Player / ship context
+    # =======================================================================
+
+    def _is_actively_piloting(
+        self
+    ):
+
+        ship_ptr = int(
+            self._active_ship_ptr
+            or 0
+        )
+
+
+        if not ship_ptr:
+
+            return False
+
+
+        try:
+
+            controller_offset = (
+                nms.cGcSpaceshipComponent
+                .mpController
+                .offset
+            )
+
+            active_offset = (
+                nms.cGcSpaceshipComponent
+                .mbControllerActive
+                .offset
+            )
+
+
+            controller_ptr = (
+                _read_pointer(
+                    ship_ptr
+                    + controller_offset
+                )
+            )
+
+
+            controller_active = (
+                _read_u8(
+                    ship_ptr
+                    + active_offset
+                )
+            )
+
+
+            return (
+                bool(
+                    controller_active
+                )
+                and
+                bool(
+                    controller_ptr
+                )
+            )
+
+
+        except Exception:
+
+            # If the captured object is no longer readable, discard it.
+            self._active_ship_ptr = 0
+
+            return False
+
+
+    @nms.cGcSpaceshipComponent.UpdateControlled.before
+    def spaceship_update_controlled(
+        self,
+        this,
+        lfTimeStep,
+    ):
+
+        try:
+
+            ship = (
+                this.contents
+            )
+
+
+            ship_ptr = (
+                ctypes.cast(
+                    this,
+                    ctypes.c_void_p,
+                ).value
+                or 0
+            )
+
+
+            controller_active = bool(
+                ship.mbControllerActive
+            )
+
+            controller_present = bool(
+                ship.mpController
+            )
+
+
+            actively_controlled = (
+                bool(ship_ptr)
+                and controller_active
+                and controller_present
+            )
+
+
+            if actively_controlled:
+
+                self._active_ship_ptr = (
+                    ship_ptr
+                )
+
+                if self._ship_open_pending:
+                    self._show_available_ship_wheel(ship_ptr)
+
+                self._process_ship_request(
+                    ship_ptr
+                )
+
+
+            elif (
+                ship_ptr
+                and
+                self._active_ship_ptr
+                == ship_ptr
+            ):
+
+                self._active_ship_ptr = 0
+
+                with self._request_lock:
+
+                    if (
+                        self._ship_target_mode
+                        is not None
+                    ):
+
+                        self._ship_target_mode = None
+                        self._ship_cycle_start_mode = None
+                        self._ship_cycle_steps = 0
+
+                        self._set_status(
+                            "SHIP REQUEST ABORTED | "
+                            "no longer piloting"
+                        )
+
+
+        except Exception as exc:
+
+            self._set_status(
+                "SHIP CONTEXT READ FAILED | "
+                f"{exc!r}"
+            )
+
+
+    def _show_available_ship_wheel(self, ship_ptr):
+        # Native inventory access belongs on the controlled-ship update thread.
+        self._ship_open_pending = False
+        try:
+            state = _read_ship_weapon_state(ship_ptr)
+            layout = _resolve_nms_layout()
+            address = layout["ship_available_address"]
+            _verify_signature_at(address, "Ship availability", SHIP_AVAILABLE_SIGNATURE)
+            available = _ShipAvailableProto(address)
+            modes = tuple(
+                mode for mode in range(SHIP_MODE_COUNT)
+                if available(ctypes.c_void_p(state["weapons_ptr"]), mode)
+            )
+            if not self._wheel_open or self._wheel_context != "ship":
+                return
+            if not modes:
+                self._wheel_open = False
+                self._set_status("SHIP OPEN REFUSED | no available native weapons")
+                return
+            self._ship_available_modes = modes
+            self._overlay.show(
+                [("ship", mode) for mode in modes], None, None, state["mode"]
+            )
+            self._set_status(
+                "SHIP WHEEL OPEN | "
+                + ", ".join(_entry_name("ship", mode) for mode in modes)
+            )
+        except Exception as exc:
+            self._wheel_open = False
+            self._ship_available_modes = ()
+            self._set_status(f"SHIP AVAILABILITY FAILED | {exc!r}")
+            logger.exception("[WeaponWheel] Ship availability failed.")
+
+    def _process_ship_request(
+        self,
+        ship_ptr,
+    ):
+
+        with self._request_lock:
+
+            target = (
+                self._ship_target_mode
+            )
+
+            start_mode = (
+                self._ship_cycle_start_mode
+            )
+
+            steps = (
+                self._ship_cycle_steps
+            )
+
+
+        if target is None:
+
+            return
+
+
+        try:
+
+            state = _read_ship_weapon_state(
+                ship_ptr
+            )
+
+            current = state[
+                "mode"
+            ]
+
+
+            if current == target:
+
+                with self._request_lock:
+
+                    self._ship_target_mode = None
+                    self._ship_cycle_start_mode = None
+                    self._ship_cycle_steps = 0
+
+
+                self._set_status(
+                    "SHIP COMMITTED | "
+                    f"{_entry_name('ship', target)} | "
+                    f"mode={target}"
+                )
+
+                return
+
+
+            if steps >= SHIP_MODE_COUNT:
+
+                with self._request_lock:
+
+                    self._ship_target_mode = None
+                    self._ship_cycle_start_mode = None
+                    self._ship_cycle_steps = 0
+
+
+                self._set_status(
+                    "SHIP ABORTED | "
+                    f"{_entry_name('ship', target)} was not reached "
+                    "within one full native cycle"
+                )
+
+                return
+
+
+            _verify_ship_cycle(
+                state[
+                    "cycle_address"
+                ]
+            )
+
+            address = _resolve_nms_layout()["ship_available_address"]
+            _verify_signature_at(address, "Ship availability", SHIP_AVAILABLE_SIGNATURE)
+            if not _ShipAvailableProto(address)(
+                ctypes.c_void_p(state["weapons_ptr"]), target
+            ):
+                with self._request_lock:
+                    self._ship_target_mode = None
+                    self._ship_cycle_start_mode = None
+                    self._ship_cycle_steps = 0
+                self._set_status("SHIP ABORTED | target no longer available")
+                return
+
+            before = current
+
+            cycle = _CycleShipWeaponProto(
+                state[
+                    "cycle_address"
+                ]
+            )
+
+            cycle(
+                ctypes.c_void_p(
+                    state[
+                        "weapons_ptr"
+                    ]
+                )
+            )
+
+            after_state = _read_ship_weapon_state(
+                ship_ptr
+            )
+
+            after = after_state[
+                "mode"
+            ]
+
+            steps += 1
+
+
+            if after == target:
+
+                with self._request_lock:
+
+                    self._ship_target_mode = None
+                    self._ship_cycle_start_mode = None
+                    self._ship_cycle_steps = 0
+
+
+                self._set_status(
+                    "SHIP COMMITTED | "
+                    f"{_entry_name('ship', target)} | "
+                    f"before={before} | "
+                    f"after={after} | "
+                    f"steps={steps}"
+                )
+
+                return
+
+
+            if after == before:
+
+                with self._request_lock:
+
+                    self._ship_target_mode = None
+                    self._ship_cycle_start_mode = None
+                    self._ship_cycle_steps = 0
+
+
+                self._set_status(
+                    "SHIP ABORTED | "
+                    "native cycle did not change mode | "
+                    f"mode={after}"
+                )
+
+                return
+
+
+            if (
+                start_mode is not None
+                and
+                after == start_mode
+            ):
+
+                with self._request_lock:
+
+                    self._ship_target_mode = None
+                    self._ship_cycle_start_mode = None
+                    self._ship_cycle_steps = 0
+
+
+                self._set_status(
+                    "SHIP UNAVAILABLE | "
+                    f"{_entry_name('ship', target)} | "
+                    "native cycle wrapped to start"
+                )
+
+                return
+
+
+            with self._request_lock:
+
+                self._ship_cycle_steps = (
+                    steps
+                )
+
+
+        except Exception as exc:
+
+            with self._request_lock:
+
+                self._ship_target_mode = None
+                self._ship_cycle_start_mode = None
+                self._ship_cycle_steps = 0
+
+
+            self._set_status(
+                "SHIP CALL FAILED | "
+                f"target={target} | "
+                f"{exc!r}"
+            )
+
+            logger.exception(
+                "[WeaponWheel] "
+                "Ship native cycle failed."
+            )
+
+
+    # =======================================================================
     # G takeover
     # =======================================================================
 
@@ -3250,11 +3700,21 @@ class WeaponWheelPrototype(Mod):
             True  = allow key through
             False = consume key
 
-        G therefore behaves normally outside NMS.
-        While NMS is foreground, both G-down and G-up are swallowed.
+        G behaves normally outside the NMS process.
+
+        Inside NMS, G is context-sensitive:
+
+            On foot / standing inside a ship:
+                open the multitool wheel.
+
+            Actively piloting:
+                open the starship weapon wheel.
+
+        The context chosen on key-down is retained until key-up.
         """
 
-        if not _is_nms_foreground():
+        # Always finish a G gesture that began in NMS, even after focus changes.
+        if not _is_nms_foreground() and not self._g_down:
 
             return True
 
@@ -3270,9 +3730,19 @@ class WeaponWheelPrototype(Mod):
 
                     self._g_down = True
 
+                    context = (
+                        "ship"
+                        if self._is_actively_piloting()
+                        else "multitool"
+                    )
+
+                    self._wheel_context = (
+                        context
+                    )
 
                     self._open_wheel(
-                        "G"
+                        "G",
+                        context=context,
                     )
 
 
@@ -3285,10 +3755,17 @@ class WeaponWheelPrototype(Mod):
 
                     self._g_down = False
 
+                    context = (
+                        self._wheel_context
+                        or "multitool"
+                    )
 
                     self._close_wheel(
-                        "G"
+                        "G",
+                        context=context,
                     )
+
+                    self._wheel_context = None
 
 
         except Exception:
@@ -3299,8 +3776,7 @@ class WeaponWheelPrototype(Mod):
             )
 
 
-        # Prevent vanilla NMS from seeing G.
-
+        # The wheel owns G while the NMS process is foreground.
         return False
 
 
@@ -3311,6 +3787,7 @@ class WeaponWheelPrototype(Mod):
     def _open_wheel(
         self,
         source,
+        context=None,
     ):
 
         if self._wheel_open:
@@ -3318,7 +3795,48 @@ class WeaponWheelPrototype(Mod):
             return
 
 
+        context = (
+            context
+            or (
+                "ship"
+                if self._is_actively_piloting()
+                else "multitool"
+            )
+        )
+
+
         try:
+
+            if context == "ship":
+
+                ship_ptr = int(
+                    self._active_ship_ptr
+                    or 0
+                )
+
+
+                if not self._is_actively_piloting():
+
+                    self._set_status(
+                        f"{source} SHIP OPEN REFUSED | "
+                        "not actively piloting"
+                    )
+
+                    return
+
+
+                state = _read_ship_weapon_state(
+                    ship_ptr
+                )
+
+                self._wheel_open = True
+                self._wheel_context = "ship"
+                self._ship_available_modes = ()
+                self._overlay._set_selected(None)
+                self._ship_open_pending = True
+                self._set_status("SHIP WHEEL | checking native availability")
+                return
+
 
             (
                 state,
@@ -3339,7 +3857,7 @@ class WeaponWheelPrototype(Mod):
 
 
             self._wheel_open = True
-
+            self._wheel_context = "multitool"
 
             self._overlay.show(
                 entries,
@@ -3349,6 +3867,7 @@ class WeaponWheelPrototype(Mod):
                 state[
                     "secondary_mode"
                 ],
+                None,
             )
 
 
@@ -3388,13 +3907,11 @@ class WeaponWheelPrototype(Mod):
 
             self._wheel_open = False
 
-
             self._set_status(
                 f"{source} "
                 "WHEEL OPEN FAILED | "
                 f"{exc!r}"
             )
-
 
             logger.exception(
                 "[WeaponWheel] "
@@ -3405,6 +3922,7 @@ class WeaponWheelPrototype(Mod):
     def _close_wheel(
         self,
         source,
+        context=None,
     ):
 
         if not self._wheel_open:
@@ -3413,13 +3931,18 @@ class WeaponWheelPrototype(Mod):
 
 
         self._wheel_open = False
+        self._ship_open_pending = False
 
+        context = (
+            context
+            or self._wheel_context
+            or "multitool"
+        )
 
         selected = (
             self._overlay
             .selected_entry()
         )
-
 
         self._overlay.hide()
 
@@ -3429,6 +3952,15 @@ class WeaponWheelPrototype(Mod):
             self._set_status(
                 f"{source} WHEEL CLOSED | "
                 "no selection"
+            )
+
+            return
+
+
+        if context == "ship":
+
+            self._arm_ship_entry(
+                selected
             )
 
             return
@@ -3605,6 +4137,118 @@ class WeaponWheelPrototype(Mod):
             )
 
 
+    def _arm_ship_entry(
+        self,
+        entry,
+    ):
+
+        try:
+
+            (
+                kind,
+                native_id,
+            ) = entry
+
+
+            if kind != "ship":
+
+                raise RuntimeError(
+                    "Ship wheel returned non-ship entry: "
+                    f"{entry!r}"
+                )
+
+
+            if native_id not in self._ship_available_modes:
+
+                raise RuntimeError(
+                    f"Ship mode {native_id} was not available when the wheel opened."
+                )
+
+
+            if not self._is_actively_piloting():
+
+                self._set_status(
+                    "SHIP ARM REFUSED | "
+                    "not actively piloting"
+                )
+
+                return
+
+
+            state = _read_ship_weapon_state(
+                self._active_ship_ptr
+            )
+
+
+            if state["mode"] == native_id:
+
+                self._set_status(
+                    "NO CALL | "
+                    f"{_entry_name(kind, native_id)} "
+                    "already current"
+                )
+
+                return
+
+
+            _verify_ship_cycle(
+                state[
+                    "cycle_address"
+                ]
+            )
+
+
+            with self._request_lock:
+
+                if (
+                    self._ship_target_mode
+                    is not None
+                ):
+
+                    self._set_status(
+                        "SHIP REFUSED | "
+                        "request already armed | "
+                        f"target={self._ship_target_mode}"
+                    )
+
+                    return
+
+
+                self._ship_target_mode = (
+                    native_id
+                )
+
+                self._ship_cycle_start_mode = (
+                    state[
+                        "mode"
+                    ]
+                )
+
+                self._ship_cycle_steps = 0
+
+
+            self._set_status(
+                "SHIP ARMED | "
+                f"{native_id} "
+                f"({_entry_name(kind, native_id)}) | "
+                f"start={state['mode']}"
+            )
+
+
+        except Exception as exc:
+
+            self._set_status(
+                "SHIP ARM FAILED | "
+                f"{entry!r} | "
+                f"{exc!r}"
+            )
+
+            logger.exception(
+                "[WeaponWheel] "
+                "Ship arm failed."
+            )
+
+
     # =======================================================================
     # Diagnostics
     # =======================================================================
@@ -3749,6 +4393,46 @@ class WeaponWheelPrototype(Mod):
             )
 
 
+    @gui_button(
+        "Read ship weapon state"
+    )
+    def read_ship_weapon_state(
+        self
+    ):
+
+        try:
+
+            if not self._is_actively_piloting():
+
+                self._set_status(
+                    "SHIP READ | not actively piloting"
+                )
+
+                return
+
+
+            state = _read_ship_weapon_state(
+                self._active_ship_ptr
+            )
+
+            self._set_status(
+                "SHIP READ | "
+                f"ship=0x{state['ship_ptr']:X} | "
+                f"weapons=0x{state['weapons_ptr']:X} | "
+                f"mode={state['mode']} "
+                f"({_entry_name('ship', state['mode'])}) | "
+                f"cycle=0x{state['cycle_address']:X}"
+            )
+
+
+        except Exception as exc:
+
+            self._set_status(
+                "SHIP READ FAILED | "
+                f"{exc!r}"
+            )
+
+
     # =======================================================================
     # F8 fallback
     # =======================================================================
@@ -3761,7 +4445,8 @@ class WeaponWheelPrototype(Mod):
     ):
 
         self._open_wheel(
-            "F8"
+            "F8",
+            context="multitool",
         )
 
 
@@ -3773,7 +4458,8 @@ class WeaponWheelPrototype(Mod):
     ):
 
         self._close_wheel(
-            "F8"
+            "F8",
+            context="multitool",
         )
 
 
@@ -4056,3 +4742,4 @@ class WeaponWheelPrototype(Mod):
                 "[WeaponWheel] "
                 "Native call failed."
             )
+
