@@ -1,8 +1,8 @@
 <div align="center">
 
-# No Man's Sky Radial Multitool Weapon Wheel
+# No Man's Sky Radial Multitool & Starship Weapon Wheel
 
-### Direct radial selection for No Man's Sky multitool weapons using pyMHF / NMS.py
+### Context-sensitive radial selection for No Man's Sky multitool and starship weapons using pyMHF / NMS.py
 
 Hold **G**, move toward the weapon you want, then release **G** to select it.
 
@@ -11,9 +11,11 @@ Hold **G**, move toward the weapon you want, then release **G** to select it.
 ---
 
 > [!NOTE]
-> **Status — September 30, 2026**
+> **Status — October 1, 2026**
 >
-> The mod is working again after the September 30 No Man's Sky update.
+> The multitool wheel was restored after the September 30 No Man's Sky update. The combined build now also includes a starship weapon wheel.
+>
+> Both weapon wheels are confirmed working in-game on the tested setup. The gaps between wedges no longer cause a problem, and the starship wheel displays correctly named entries corresponding to the installed weapons available to select.
 >
 > The latest repair also replaces most hard-coded, update-sensitive addresses with runtime signature scanning and validation. This makes the mod substantially more update-resistant, but not completely update-proof.
 
@@ -21,19 +23,27 @@ Hold **G**, move toward the weapon you want, then release **G** to select it.
 
 - Direct selection of primary multitool weapon modes.
 - Direct selection of secondary / alt weapons.
-- One radial wheel for both primary and secondary weapons.
+- One multitool radial wheel for both primary and secondary weapons.
+- A separate starship weapon wheel while actively piloting.
+- Context-sensitive **G** routing; the chosen wheel context is retained until release.
+- Filters ship entries through the game's native weapon-availability check.
+- Confirmed ship labels: Phase Beam, Photon Cannon, Positron Ejector, and Rocket Launcher.
+- Ship selection uses native cycling on the controlled-ship update thread.
 - Automatically detects which supported modes are installed on the active multitool.
 - Hold **G** to open the wheel and release **G** to select.
-- **F8** remains available as a fallback/test binding.
+- **F8** remains available as an unsuppressed multitool fallback/test binding.
 - Uses No Man's Sky's own native weapon-selection functions.
 - Respects the game's deferred primary-weapon transition behavior.
-- Makes exactly one native setter request per wheel selection.
+- Makes exactly one native setter request per multitool selection.
+- Makes at most one native ship-cycle call per controlled-ship update while pursuing a selected target.
 - Does **not** manually force current/pending weapon-state fields.
 - Dynamically resolves important native functions and offsets at runtime.
 - Validates resolved code before making native calls.
-- Fails safely when the expected NMS layout cannot be verified.
+- Refuses native calls when required signatures or checked layout values cannot be verified.
 - Compact, semi-transparent radial interface.
-- Background-free Win32-shaped overlay.
+- Circular Win32-shaped overlay without a rectangular background.
+- Continuous wedge geometry and a solid circular native region remove the previous radial gaps.
+- Handles release of an active **G** gesture even if focus changes.
 - Wheel is positioned near the held multitool area instead of directly over the center of the screen.
 
 ---
@@ -52,9 +62,11 @@ Hold **G**, move toward the weapon you want, then release **G** to select it.
 - [Weapon state](#weapon-state)
 - [Primary weapon IDs](#primary-weapon-ids)
 - [Secondary weapon IDs](#secondary-weapon-ids)
+- [Starship weapon wheel](#starship-weapon-wheel)
 - [Installed-mode detection](#installed-mode-detection)
 - [Modes 9 and 10](#modes-9-and-10)
 - [Selection safety](#selection-safety)
+- [Deferred primary transitions](#deferred-primary-transitions)
 - [Radial-wheel rendering](#radial-wheel-rendering)
 - [Win32 / Tkinter HWND details](#win32--tkinter-hwnd-details)
 - [Reverse-engineering history](#reverse-engineering-history)
@@ -72,26 +84,32 @@ Hold **G**, move toward the weapon you want, then release **G** to select it.
 
 | Action | Control |
 |---|---|
-| Open radial wheel | Hold `G` |
+| Open multitool wheel on foot / when not actively piloting | Hold `G` |
+| Open starship weapon wheel while actively piloting | Hold `G` |
 | Highlight a weapon | Move the mouse toward a wedge |
 | Select highlighted weapon | Release `G` |
-| Fallback/test wheel | Hold/release `F8` |
+| Multitool fallback/test wheel, regardless of ship context | Hold/release `F8` |
 
 Normal flow:
 
 ```text
 Hold G
   ↓
-Open radial wheel
+Choose multitool or starship wheel from piloting context
   ↓
 Move mouse toward desired weapon
   ↓
 Release G
   ↓
-Queue exactly one native weapon-selection request
+Queue one selection request
+  ↓
+Multitool: one native setter call
+Starship: bounded native cycling toward the target
 ```
 
-`F8` uses the same radial-selection system without relying on the normal `G` takeover path.
+`F8` always uses the multitool wheel without relying on the normal `G` takeover path.
+
+The blocking `G` hook allows normal G input outside the NMS process. When a window belonging to NMS is foreground, it consumes G and opens the appropriate wheel. Repeated key-down events do not reopen it. A gesture that began in NMS is completed on release even if focus changes.
 
 ---
 
@@ -128,7 +146,7 @@ Machine-specific usernames and local absolute paths are intentionally omitted.
 
 ## Confirmed working
 
-The following have been confirmed in-game:
+The original README records the following multitool behavior as confirmed in-game:
 
 - Direct primary weapon selection.
 - Direct secondary weapon selection.
@@ -137,7 +155,7 @@ The following have been confirmed in-game:
 - Plasma Launcher, Geology Cannon, and Paralysis Mortar selection.
 - `G` hold/release radial control.
 - `F8` fallback/test control.
-- One native setter request per wheel selection.
+- One native setter request per multitool selection.
 - Deferred primary transitions owned by NMS rather than forced by the mod.
 - Runtime signature scanning.
 - Runtime address/layout validation.
@@ -147,6 +165,26 @@ The following have been confirmed in-game:
 - Correct placement near the held multitool area.
 - Background-free shaped Win32 window.
 - Mouse selection restored after separating the Tk client HWND behavior from the top-level wrapper HWND behavior.
+
+## Observed starship behavior
+
+The earlier combined build was tested on a ship with these four weapons:
+
+- Phase Beam: internal mode `0` / Laser.
+- Photon Cannon: internal mode `1` / Projectile.
+- Positron Ejector: internal mode `2` / Shotgun.
+- Rocket Launcher: internal mode `6` / Rocket.
+
+The earlier wheel also exposed Minigun, Plasma, and Missile. Selecting those entries ended on Positron Ejector on this ship; that does not establish their weapon mappings.
+
+## Latest in-game validation — October 1, 2026
+
+- Both the multitool and starship wheels work as intended on the tested setup.
+- Native ship-weapon availability filtering shows the installed weapons available to select.
+- The displayed starship weapon names correspond to those weapons.
+- The spaces between wedges no longer cause a problem.
+
+Python syntax parsing, isolated simulated behavior checks, and static verification of the availability-call target against the local NMS executable also passed. The in-game report does not separately establish behavior after changing ships, installing/removing technologies, losing target availability during selection, or changing focus while G is held.
 
 > [!IMPORTANT]
 > The current mod no longer depends entirely on the exact RVAs from the original reverse-engineering build.
@@ -175,13 +213,11 @@ The wheel uses a shaped native Win32 region instead of a normal rectangular over
 The relevant APIs are:
 
 ```text
-CreatePolygonRgn
 CreateEllipticRgn
-CombineRgn
 SetWindowRgn
 ```
 
-The resulting native window exists only where the wedges and center circle are drawn.
+The resulting native window is a solid circle covering the wedges and center, with a small margin for outlines. It no longer has native-region holes between adjacent wedges.
 
 That removes the large rectangular background that earlier Tkinter prototypes displayed behind the interface.
 
@@ -197,7 +233,9 @@ A `ClipCursor` experiment was tested to trap the mouse inside an invisible selec
 
 The current version therefore leaves pointer movement unrestricted.
 
-A future input revision may address this without physically trapping the mouse.
+The latest seam fix addresses gaps **inside** the wheel; it does not trap the pointer inside the outer boundary.
+
+The angular selection calculation has a center dead zone but no outer-radius cutoff. An entry can therefore remain highlighted after the pointer leaves the visible wheel.
 
 ---
 
@@ -207,7 +245,7 @@ No Man's Sky normally cycles multitool weapon modes sequentially.
 
 With many technologies installed, repeatedly cycling through every mode becomes slow and easy to overshoot.
 
-The goal of this project was to identify the real weapon state and native selection functions, determine which modes are installed on the active multitool, and expose those targets through a radial menu.
+The goal of this project was to identify the real weapon state and native selection functions, determine which modes are installed on the active multitool, and expose those targets through a radial menu. The combined build extends that interface to starship weapons using the game's availability check and native cycle routine.
 
 The central design decision is:
 
@@ -222,45 +260,29 @@ This lets NMS continue to own its normal transition logic.
 At a high level:
 
 ```text
-                ┌─────────────────────┐
-                │ Hold G / F8         │
-                └─────────┬───────────┘
-                          │
-                          v
-                ┌─────────────────────┐
-                │ Read installed-mode │
-                │ table               │
-                └─────────┬───────────┘
-                          │
-                          v
-                ┌─────────────────────┐
-                │ Filter internal /   │
-                │ unmapped modes      │
-                └─────────┬───────────┘
-                          │
-                          v
-                ┌─────────────────────┐
-                │ Build radial wheel  │
-                └─────────┬───────────┘
-                          │
-                          v
-                ┌─────────────────────┐
-                │ Mouse selects wedge │
-                └─────────┬───────────┘
-                          │
-                    key released
-                          │
-              ┌───────────┴────────────┐
-              │                        │
-              v                        v
-     ┌──────────────────┐     ┌──────────────────┐
-     │ Primary entry    │     │ Secondary entry  │
-     │                  │     │                  │
-     │ primary setter   │     │ secondary setter │
-     └──────────────────┘     └──────────────────┘
+Hold G
+  ↓
+Check active piloting context
+  ├── Not piloting → read multitool mode table
+  │                    ↓
+  │                  filter mapped primary/secondary modes
+  │
+  └── Piloting → wait for controlled-ship update
+                       ↓
+                     check native availability for ship modes 0–6
+  ↓
+Build the appropriate radial wheel
+  ↓
+Move mouse; release G
+  ├── Primary multitool → primary setter on player update
+  ├── Secondary multitool → secondary setter on player update
+  └── Starship → one native cycle call per controlled-ship update
+                 until the target is reached or the request is aborted
 ```
 
-Primary and secondary weapons use separate native setters because NMS keeps those selections in separate state.
+Primary and secondary weapons use separate native setters because NMS keeps those selections in separate state. Ship selection uses the native cycle routine rather than a direct ship-mode write.
+
+`F8` always follows the multitool path. Ship context is determined from a captured controlled-ship pointer, `mbControllerActive`, and a non-null `mpController`; there is no separate physical-location test for standing inside a ship.
 
 ---
 
@@ -282,7 +304,10 @@ The resolver dynamically locates or derives:
 - pending idle sentinel;
 - primary setter;
 - secondary setter;
-- installed-mode table offset.
+- installed-mode table offset;
+- ship weapon cycle routine;
+- ship current-mode field offset;
+- ship availability predicate, derived from the cycle routine's relative call.
 
 Current signature groups include:
 
@@ -293,9 +318,11 @@ SECONDARY_SETTER_SIGNATURE
 PENDING_MODE_SIGNATURE
 MODE_TABLE_SIGNATURE
 WEAPON_WRAPPER_SIGNATURE
+SHIP_CYCLE_SIGNATURE
+SHIP_AVAILABLE_SIGNATURE
 ```
 
-Each required signature is expected to resolve uniquely.
+Each independently scanned signature is expected to resolve uniquely. The ship availability predicate is resolved from a checked relative call in the ship cycle routine, then verified against its own signature.
 
 The resolver also cross-checks independently derived values where possible.
 
@@ -317,7 +344,8 @@ global_rva=... |
 weapon_off=... |
 primary_rva=... |
 secondary_rva=... |
-hold G for radial wheel |
+ship_cycle_rva=... |
+hold G for context radial wheel |
 F8 fallback enabled
 ```
 
@@ -329,6 +357,8 @@ UNSUPPORTED NMS BUILD | wheel disabled
 
 > [!NOTE]
 > Signature scanning makes the mod more resilient to ordinary address movement, but a sufficiently large game update can still change the actual code patterns, structure layout, calling conventions, or weapon logic.
+>
+> Ship weapons are still assumed to be embedded at component offset `+0x60`. Controller fields come from the installed NMS.py definitions. These assumptions are not fully recovered from signatures, and readable pointers alone do not prove a correct object layout.
 
 ---
 
@@ -367,6 +397,8 @@ The current mod does **not** assume those exact RVAs will remain unchanged in fu
 ---
 
 # Weapon state
+
+The following numeric offsets describe the documented September 30 build; the mod derives the corresponding multitool offsets at runtime.
 
 Three weapon-object fields are especially important:
 
@@ -431,6 +463,56 @@ Confirmed secondary IDs:
 Secondary selection uses a different native setter from primary selection.
 
 This distinction was necessary because NMS maintains current primary state and selected secondary state independently.
+
+---
+
+# Starship weapon wheel
+
+## Context detection
+
+```python
+@nms.cGcSpaceshipComponent.UpdateControlled.before
+```
+
+captures a ship component when its controller is active and present. G chooses the ship wheel only while that captured component still passes the controller checks.
+
+The context is retained from G press to release. Native ship work runs in the controlled-ship update hook, rather than the keyboard or Tk callback.
+
+## Ship mode IDs
+
+| ID | Internal enum label | Current wheel label / evidence |
+|---:|---|---|
+| `0` | Laser | Phase Beam — observed in-game |
+| `1` | Projectile | Photon Cannon — observed in-game |
+| `2` | Shotgun | Positron Ejector — observed in-game |
+| `3` | Minigun | Internal label retained; mapping not verified |
+| `4` | Plasma | Internal label retained; mapping not verified |
+| `5` | Missile | Internal label retained; mapping not verified |
+| `6` | Rocket | Rocket Launcher — observed in-game |
+
+## Native availability filtering
+
+The ship cycle routine calls a native predicate for each candidate mode. Static inspection shows that this predicate consults inventory and technology state.
+
+The latest mod resolves that predicate from the cycle routine and calls it for modes `0–6` on the controlled-ship update thread when opening the ship wheel. Only modes accepted by the predicate appear.
+
+This follows **native availability**, which may depend on more than whether a technology is installed. It does not assume that the multitool availability table also describes ship weapons, and it does not use a fixed four-weapon loadout.
+
+Automatic filtering is confirmed working for the tested ship and loadout. Behavior after changing ships or installing/removing weapons has not yet been separately reported.
+
+## Target selection
+
+Releasing G arms the highlighted mode. Each controlled-ship update:
+
+1. Reads the current ship mode.
+2. Finishes the request if the target is already current.
+3. Verifies the native functions and rechecks target availability.
+4. Makes at most one native cycle-next call.
+5. Reads the resulting mode and either finishes or continues on a later update.
+
+The request stops if the target becomes unavailable, cycling makes no change, cycling returns to its starting mode, seven calls have been attempted, a checked read/call fails, or loss of control is observed for the captured component.
+
+The ship mode field is read, not directly overwritten.
 
 ---
 
@@ -527,7 +609,7 @@ The game's native setters are used instead.
 
 Wheel release creates one selection request.
 
-That request is removed from the queue before execution so it cannot accidentally turn into a native call every frame.
+A multitool request is cleared before execution and produces at most one setter call. A ship request remains active only while pursuing its target through bounded native cycling, with at most one cycle call per controlled-ship update.
 
 ## Respect pending primary transitions
 
@@ -543,7 +625,7 @@ This gives NMS time to finish its own deferred transition.
 
 ## Validate native code before calling it
 
-Before either setter is invoked, the resolved native address is checked against the expected signature.
+Before a multitool setter, ship availability check, or ship cycle routine is invoked, its resolved native address is checked against the expected signature.
 
 If the code no longer matches, the call is refused.
 
@@ -651,9 +733,13 @@ and approximately:
 78% opacity
 ```
 
-The top-level window is clipped to the union of the wedge polygons and center circle.
+The top-level window is clipped to one solid circular region. Adjacent drawn wedges now share angular boundaries.
 
-This removes the rectangular background entirely.
+The earlier build trimmed each drawn wedge by `0.015` radians per edge and each native wedge region by `0.008` radians per edge. That left both visible gaps and narrow strips where the native overlay window did not exist.
+
+The angle-based selection calculation already covered all directions outside its center dead zone. The camera-control symptom was consistent with the native-region holes exposing the game underneath, rather than an angular selection gap.
+
+The latest build removes the drawing trims and replaces the union of separated wedge regions with a solid ellipse. This keeps the circular shape without a rectangular background. In-game testing confirmed that the spaces between wedges no longer cause a problem.
 
 ---
 
@@ -1070,6 +1156,8 @@ Several failed approaches still helped narrow the problem.
 - Shaping only the Tk child/client HWND left the top-level translucent rectangle visible.
 - Applying input/window styles to the wrong HWND caused NMS to keep consuming mouse movement.
 - `ClipCursor` successfully kept the mouse inside a bounded area, but the invisible constraint felt too restrictive and was removed.
+- Separately trimmed wedge regions left tiny native-window holes between slices.
+- Showing every ship enum mode exposed unavailable targets; the latest build filters through the native availability predicate.
 
 ---
 
@@ -1090,6 +1178,7 @@ Development has used:
 - read-only diagnostic/probe mods
 - temporary native hooks for tracing
 - hardware write breakpoints
+- Python `pefile` and `iced_x86` for static executable inspection
 - install/uninstall experiments
 - repeated in-game validation
 
@@ -1105,7 +1194,7 @@ Simulating repeated `G` presses would still:
 - make primary/secondary handling awkward;
 - rely heavily on timing.
 
-The native approach lets the radial wheel represent actual weapon targets.
+The native approach lets the radial wheel represent actual weapon targets. Multitool selection calls the appropriate setter directly; starship selection currently follows the native cycle routine until the selected target is reached.
 
 The game can go directly from Mining Beam to Scatter Blaster, or directly change the selected secondary weapon from Plasma Launcher to Paralysis Mortar, without cycling through every intermediate technology.
 
@@ -1115,15 +1204,17 @@ The game can go directly from Mining Beam to Scatter Blaster, or directly change
 
 Potential next steps:
 
-1. Improve mouse ownership while the wheel is open without using a restrictive cursor bounding box.
-2. Add user configuration.
-3. Add optional weapon icons.
-4. Improve primary/secondary visual distinction.
-5. Improve packaging and installation documentation.
-6. Continue strengthening update/version validation.
-7. Re-scan cleanly when the active multitool changes if needed.
-8. Map any remaining useful unknown mode IDs.
-9. Investigate a more native-feeling No Man's Sky-style radial UI.
+1. Extend ship-filtering validation to ship changes and technology installation/removal.
+2. Verify the remaining ship enum labels against installed technologies.
+3. Improve mouse ownership while the wheel is open without using a restrictive cursor bounding box.
+4. Add user configuration.
+5. Add optional weapon icons.
+6. Improve primary/secondary visual distinction.
+7. Improve packaging and installation documentation.
+8. Continue strengthening update/version validation, including fixed ship layout assumptions.
+9. Re-scan cleanly when the active multitool changes if needed.
+10. Map any remaining useful unknown mode IDs.
+11. Investigate a more native-feeling No Man's Sky-style radial UI.
 
 ---
 
@@ -1154,7 +1245,7 @@ The working solution came from combining:
 - Win32 window manipulation;
 - and repeated in-game validation.
 
-The result is a radial selector that no longer needs to fake repeated weapon-cycle presses and no longer depends entirely on fixed native addresses.
+The result is a radial selector that no longer needs to fake repeated weapon-cycle key presses and no longer depends entirely on fixed native addresses. Multitool selection uses two native setters; starship selection combines native availability checks with bounded native cycling.
 
 It can address No Man's Sky's real weapon-selection machinery directly while failing safely when the expected native layout cannot be verified.
 
@@ -1162,6 +1253,6 @@ It can address No Man's Sky's real weapon-selection machinery directly while fai
 
 <div align="center">
 
-### No repeated weapon cycling. Pick the weapon you want directly.
+### Hold G. Pick your weapon. Let NMS handle the switch.
 
 </div>
